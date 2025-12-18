@@ -1,0 +1,599 @@
+use warehouse;
+
+ALTER TABLE original
+  RENAME COLUMN `YEAR` TO year,
+  RENAME COLUMN `MONTH` TO month,
+  RENAME COLUMN `SUPPLIER` TO supplier,
+  RENAME COLUMN `ITEM CODE` TO item_code,
+  RENAME COLUMN `ITEM DESCRIPTION` TO item_description,
+  RENAME COLUMN `ITEM TYPE` TO item_type,
+  RENAME COLUMN `RETAIL SALES` TO retail_sales,
+  RENAME COLUMN `RETAIL TRANSFERS` TO retail_transfers,
+  RENAME COLUMN `WAREHOUSE SALES` TO warehouse_sales;
+
+CREATE TABLE supplier (
+  supplier_id INT AUTO_INCREMENT PRIMARY KEY,
+  supplier_name VARCHAR(255) UNIQUE
+);
+
+INSERT INTO supplier (supplier_name)
+SELECT DISTINCT supplier
+FROM original;
+
+DROP TABLE IF EXISTS dim_item;
+
+CREATE TABLE dim_item (
+  item_id INT AUTO_INCREMENT PRIMARY KEY,
+  item_code INT,
+  item_description VARCHAR(255),
+  item_type VARCHAR(50),
+  UNIQUE (item_code)
+);
+
+INSERT INTO dim_item (item_code, item_description, item_type)
+SELECT
+  item_code,
+  MAX(item_description) AS item_description,
+  MAX(item_type) AS item_type
+FROM original
+GROUP BY item_code;
+
+CREATE TABLE dim_date (
+  date_id INT AUTO_INCREMENT PRIMARY KEY,
+  year INT,
+  month INT,
+  yearmonth VARCHAR(7),
+  UNIQUE (year, month)
+);
+
+INSERT INTO dim_date (year, month, yearmonth)
+SELECT DISTINCT
+  YEAR,
+  MONTH,
+  CONCAT(YEAR, '-', LPAD(MONTH, 2, '0'))
+FROM original;
+
+CREATE TABLE fact_sales (
+  date_id INT,
+  item_id INT,
+  supplier_id INT,
+  retail_sales INT,
+  retail_transfers INT,
+  warehouse_sales INT,
+  PRIMARY KEY (date_id, item_id, supplier_id),
+  FOREIGN KEY (date_id) REFERENCES dim_date(date_id),
+  FOREIGN KEY (item_id) REFERENCES dim_item(item_id),
+  FOREIGN KEY (supplier_id) REFERENCES supplier(supplier_id)
+);
+
+INSERT INTO fact_sales
+SELECT
+  d.date_id,
+  i.item_id,
+  s.supplier_id,
+  o.retail_sales,
+  o.retail_transfers,
+  o.warehouse_sales
+FROM original o
+JOIN dim_date d
+  ON o.year = d.year
+ AND o.month = d.month
+JOIN dim_item i
+  ON o.item_code = i.item_code
+JOIN supplier s
+  ON o.supplier = s.supplier_name;
+  
+SELECT COUNT(*) FROM original;
+SELECT COUNT(*) FROM fact_sales;
+
+-- Data Analysis
+-- 1. How do total retail and warehouse sales trend over time?
+select yearmonth,
+		sum(retail_sales) as "Retail_Sales", 
+		sum(warehouse_sales) as "Warehouse_Sales"
+from fact_sales as f
+join dim_date as d
+on f.date_id = d.date_id
+group by yearmonth
+order by yearmonth;
+
+-- 2. Are retail sales growing faster than warehouse sales?
+
+with sales_by_month as (
+    select 
+        yearmonth,
+        sum(retail_sales) as retail_sales, 
+        sum(warehouse_sales) as warehouse_sales
+    from fact_sales as f
+    join dim_date as d on f.date_id = d.date_id
+    group by  yearmonth
+),
+growth_calculation as (
+    select 
+        yearmonth,
+        retail_sales,
+        warehouse_sales,
+        -- Find most recent previous available month's sales
+        (retail_sales - 
+            (select retail_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by prev.yearmonth desc 
+             limit 1)
+        ) * 100.0 / 
+        NULLIF(
+            (select retail_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by prev.yearmonth DESC 
+             limit 1), 
+        0) as retail_growth_rate,
+        
+        (warehouse_sales - 
+            (select warehouse_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by prev.yearmonth DESC 
+             limit 1)
+        ) * 100.0 / 
+        NULLIF(
+            (select warehouse_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by prev.yearmonth desc 
+             limit 1), 
+        0) as warehouse_growth_rate
+    from sales_by_month current
+)
+select 
+    yearmonth,
+    retail_sales,
+    warehouse_sales,
+    round(retail_growth_rate, 2) as retail_growth_percentage,
+    round(warehouse_growth_rate, 2) as warehouse_growth_percentage,
+    case 
+        when retail_growth_rate > warehouse_growth_rate THEN 'Retail Growing Faster'
+        when retail_growth_rate < warehouse_growth_rate THEN 'Warehouse Growing Faster'
+        else 'Equal Growth'
+    end as growth_comparison
+from growth_calculation
+order by yearmonth;
+
+
+
+
+-- Which grew faster for more periods? 
+with sales_by_month as (
+    select 
+        yearmonth,
+        SUM(retail_sales) as retail_sales, 
+        SUM(warehouse_sales) as warehouse_sales
+    from fact_sales as f
+    join dim_date as d on f.date_id = d.date_id
+    group by yearmonth
+),
+growth_calculation as (
+    select 
+        yearmonth,
+        retail_sales,
+        warehouse_sales,
+        (retail_sales - 
+            (select retail_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by prev.yearmonth desc 
+             limit 1)
+        ) * 100.0 / 
+        NULLIF(
+            (select retail_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by  prev.yearmonth DESC 
+             limit 1), 
+        0) as retail_growth_rate,
+        
+        (warehouse_sales - 
+            (select warehouse_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by prev.yearmonth desc 
+             limit 1)
+        ) * 100.0 / 
+        NULLIF(
+            (select warehouse_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by prev.yearmonth DESC 
+             limit 1), 
+        0) as warehouse_growth_rate
+    from sales_by_month current
+),
+final_results as (
+    select 
+        yearmonth,
+        retail_sales,
+        warehouse_sales,
+        round(retail_growth_rate, 2) as retail_growth_percentage,
+        round(warehouse_growth_rate, 2) as warehouse_growth_percentage,
+        case 
+            when retail_growth_rate > warehouse_growth_rate then 'Retail Growing Faster'
+            when retail_growth_rate < warehouse_growth_rate then 'Warehouse Growing Faster'
+            else 'Equal Growth'
+        end as growth_comparison
+    from growth_calculation
+)
+select 
+    growth_comparison, 
+    COUNT(*) AS occurrence_count
+from final_results
+group by growth_comparison;
+
+-- 3. Which months consistently show peak sales?
+with sales_by_month as (
+    select 
+        yearmonth,
+        sum(retail_sales) as retail_sales, 
+        sum(warehouse_sales) as warehouse_sales
+    from fact_sales as f
+    join dim_date as d on f.date_id = d.date_id
+    group by yearmonth
+),
+growth_calculation as (
+    select 
+        yearmonth,
+        retail_sales,
+        warehouse_sales,
+        (retail_sales - 
+            (select retail_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by prev.yearmonth desc 
+             limit 1)
+        ) * 100.0 / 
+        NULLIF(
+            (select retail_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by prev.yearmonth desc 
+             limit 1), 
+        0) as retail_growth_rate,
+        
+        (warehouse_sales - 
+            (select warehouse_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by prev.yearmonth desc 
+             limit 1)
+        ) * 100.0 / 
+        NULLIF(
+            (select warehouse_sales 
+             from sales_by_month prev 
+             where prev.yearmonth < current.yearmonth 
+             order by prev.yearmonth desc 
+             limit 1), 
+        0) as warehouse_growth_rate
+    from sales_by_month current
+),
+peak_analysis as (
+    select 
+        yearmonth,
+        retail_sales,
+        warehouse_sales,
+        round(retail_growth_rate, 2) as retail_growth_percentage,
+        round(warehouse_growth_rate, 2) as warehouse_growth_percentage,
+        case 
+            when retail_growth_rate > warehouse_growth_rate then 'Retail Growing Faster'
+            when retail_growth_rate < warehouse_growth_rate then 'Warehouse Growing Faster'
+            else 'Equal Growth'
+        end as growth_comparison,
+        rank() over (order by retail_growth_rate desc) as retail_growth_rank,
+        rank() over (order by warehouse_growth_rate desc) as warehouse_growth_rank
+    from growth_calculation
+)
+select 
+    yearmonth,
+    retail_sales,
+    warehouse_sales,
+    retail_growth_percentage,
+    warehouse_growth_percentage,
+    growth_comparison,
+    retail_growth_rank,
+    warehouse_growth_rank
+from peak_analysis
+order by retail_growth_percentage desc, warehouse_growth_percentage desc
+limit 10;
+
+-- q3: Retail Sales Breakdown - Change Over Time
+select 
+    yearmonth,
+    retail_sales,
+    avg(retail_sales) over () as total_average,  -- Average across entire dataset
+    avg(retail_sales) over (order by yearmonth) as running_average  -- Cumulative average
+from (
+    select 
+        yearmonth,
+        SUM(retail_sales) as retail_sales
+    from fact_sales as f
+    join dim_date as d on f.date_id = d.date_id
+    group by yearmonth
+) sales_summary;
+
+
+-- q3: Warehouse Sales Breakdown - Change Over Time
+select 
+    yearmonth,
+    warehouse_sales,
+    lag(warehouse_sales) over (order by yearmonth) as previous_month_sales,
+    warehouse_sales - lag(warehouse_sales) OVER (order by yearmonth) as sales_difference
+from (
+    select 
+        yearmonth,
+        SUM(warehouse_sales) AS warehouse_sales
+    from fact_sales as f
+    join dim_date as d on f.date_id = d.date_id
+    group by yearmonth
+) sales_summary
+order by yearmonth;
+
+-- 4. How does sales volume vary by item type (beer, wine, spirits)?
+
+select item_type,
+sum(retail_sales) as Total_Retail_Sales, 
+		sum(warehouse_sales) as Total_Warehouse_Sales
+ FROM fact_sales AS f
+    JOIN dim_item AS d ON f.item_id = d.item_id
+where item_type != ""
+group by item_type
+order by Total_Retail_Sales desc;
+
+-- 5. Which item types drive the majority of retail vs warehouse sales?
+ -- retail: liquor, wine, beer
+ select item_type,
+sum(retail_sales) as Total_Retail_Sales
+ FROM fact_sales AS f
+    JOIN dim_item AS d ON f.item_id = d.item_id
+where item_type != ""
+group by item_type
+order by Total_Retail_Sales desc
+limit 3;
+
+-- warehouse: beer, wine, kegs
+select item_type,
+		sum(warehouse_sales) as Total_Warehouse_Sales
+ from fact_sales as f
+    join dim_item as d on f.item_id = d.item_id
+where item_type != ""
+group by item_type
+order by Total_Warehouse_Sales desc
+limit 3;
+
+-- 6. Are certain product categories more seasonal than others?
+
+select 
+    case 
+        when d.month in (1, 2, 3) then 'Q1'
+        when d.month in (4, 5, 6) then 'Q2'
+        when d.month in (7, 8, 9) then 'Q3'
+        when d.month in (10, 11, 12) then 'Q4'
+    end as quarter,
+    d.year,
+    di.item_type,
+    SUM(f.retail_sales) as Total_Retail_Sales,
+    SUM(f.warehouse_sales) as Total_Warehouse_Sales,
+   SUM(f.retail_sales) + SUM(f.warehouse_sales) AS Total_Sales
+from 
+    fact_sales as f
+join 
+    dim_date as d on f.date_id = d.date_id
+join 
+    dim_item di on f.item_id = di.item_id
+where item_type != ""
+group by  
+    quarter, 
+    d.year, 
+    di.item_type
+order by 
+    d.year, 
+    quarter, 
+    Total_Retail_Sales desc;
+    
+    
+    
+    WITH quarterly_sales AS (
+    SELECT 
+        d.year,
+        CASE 
+            WHEN d.month IN (1,2,3) THEN 'Q1'
+            WHEN d.month IN (4,5,6) THEN 'Q2'
+            WHEN d.month IN (7,8,9) THEN 'Q3'
+            WHEN d.month IN (10,11,12) THEN 'Q4'
+        END AS quarter,
+        di.item_type,
+        SUM(f.retail_sales) + SUM(f.warehouse_sales) AS total_sales,
+        SUM(f.retail_sales) AS total_retail_sales,
+        SUM(f.warehouse_sales) AS total_warehouse_sales
+    FROM fact_sales f
+    JOIN dim_date d ON f.date_id = d.date_id
+    JOIN dim_item di ON f.item_id = di.item_id
+    WHERE di.item_type <> ''
+    GROUP BY d.year, quarter, di.item_type
+),
+max_sales AS (
+    SELECT
+        year,
+        quarter,
+        MAX(total_sales) AS max_total_sales
+    FROM quarterly_sales
+    GROUP BY year, quarter
+)
+SELECT
+    q.year,
+    q.quarter,
+    q.item_type,
+    q.total_retail_sales,
+    q.total_warehouse_sales,
+    q.total_sales
+FROM quarterly_sales q
+JOIN max_sales m
+  ON q.year = m.year
+ AND q.quarter = m.quarter
+ AND q.total_sales = m.max_total_sales
+ORDER BY q.year, q.quarter;
+
+-- it's clear that beer remains the most popular regardless of season or year if we take into consideration both retail and warehouse
+
+-- 7. Which suppliers contribute the highest total sales volume?
+select supplier_name,
+SUM(f.retail_sales) + SUM(f.warehouse_sales) AS total_sales,
+        SUM(f.retail_sales) AS total_retail_sales,
+        SUM(f.warehouse_sales) AS total_warehouse_sales
+from supplier s
+join fact_sales f on s.supplier_id=f.supplier_id
+group by s.supplier_name
+order by total_sales desc;
+-- our best suppliers are: Crown Imports, Miller Brewing Company, and ANHEUSER BUSCH INC
+select supplier_name,
+SUM(f.retail_sales) + SUM(f.warehouse_sales) AS total_sales,
+        SUM(f.retail_sales) AS total_retail_sales,
+        SUM(f.warehouse_sales) AS total_warehouse_sales
+from supplier s
+join fact_sales f on s.supplier_id=f.supplier_id
+group by s.supplier_name
+order by total_sales
+limit 5;
+-- our worst supplier is PREMIUM DISTRIBUTORS INC
+
+-- 8. How concentrated are sales among top suppliers?
+
+select
+    s.supplier_name,
+    SUM(f.retail_sales) + SUM(f.warehouse_sales) AS total_sales,
+    (SUM(f.retail_sales) + SUM(f.warehouse_sales))
+        / SUM(SUM(f.retail_sales) + SUM(f.warehouse_sales)) over () 
+        * 100 as pct_of_total
+from supplier s
+join fact_sales f 
+    on s.supplier_id = f.supplier_id
+group by s.supplier_name
+order by total_sales desc;
+
+WITH supplier_totals AS (
+    select
+        s.supplier_name,
+        SUM(f.retail_sales) + SUM(f.warehouse_sales) AS total_sales
+    from supplier s
+    join fact_sales f
+        on s.supplier_id = f.supplier_id
+    group by s.supplier_name
+),
+ranked AS (
+    select
+        supplier_name,
+        total_sales,
+        total_sales / SUM(total_sales) OVER () * 100 AS pct_of_total
+    from supplier_totals
+)
+select
+    SUM(total_sales) AS top_5_total_sales,
+    SUM(pct_of_total) AS top_5_pct_of_total
+from (
+    select *
+    from ranked
+    order by total_sales desc
+    limit 5
+) t5totals;
+-- the top 5 suppliers make up ~60% of total sales
+
+-- 9. Do top suppliers perform better in retail or warehouse channels?
+select supplier_name,
+total_retail_sales+total_warehouse_sales AS total_sales,
+total_retail_sales,
+total_warehouse_sales,
+        case 
+			when total_retail_sales > total_warehouse_sales then 'More_Retail'
+			when total_retail_sales < total_warehouse_sales then 'More_Warehouse'
+			else 'Neither'
+        end as 'Better_Channel'
+from (
+select s.supplier_name,
+		sum(f.retail_sales) as total_retail_sales,
+        sum(f.warehouse_sales) as total_warehouse_sales
+from supplier s
+join fact_sales f on s.supplier_id=f.supplier_id
+group by s.supplier_name) total
+order by total_sales desc;
+
+
+-- count of which channel: warehouse more often results in the bulk of the sales
+WITH supplier_totals AS (
+    SELECT 
+        s.supplier_name,
+        SUM(f.retail_sales) AS total_retail_sales,
+        SUM(f.warehouse_sales) AS total_warehouse_sales
+    FROM supplier s
+    JOIN fact_sales f 
+        ON s.supplier_id = f.supplier_id
+    GROUP BY s.supplier_name
+),
+channel_classification AS (
+    SELECT
+        supplier_name,
+        total_retail_sales,
+        total_warehouse_sales,
+        total_retail_sales + total_warehouse_sales AS total_sales,
+        CASE
+            WHEN total_retail_sales > total_warehouse_sales THEN 'More_Retail'
+            WHEN total_retail_sales < total_warehouse_sales THEN 'More_Warehouse'
+            ELSE 'Neither'
+        END AS Better_Channel
+    FROM supplier_totals
+)
+SELECT
+    Better_Channel,
+    COUNT(*) AS occurrence_count
+FROM channel_classification
+GROUP BY Better_Channel;
+
+-- 10. How do retail transfers compare to retail sales over time?
+select yearmonth,
+		sum(retail_sales) as "Retail_Sales", 
+		sum(retail_transfers) as "Retail_Transfers",
+        sum(retail_transfers)/sum(retail_sales) as "Transfer/Sale"
+from fact_sales as f
+join dim_date as d
+on f.date_id = d.date_id
+group by yearmonth
+order by yearmonth;
+
+-- 11. Are there periods where transfers significantly exceed sales?
+select yearmonth,
+		sum(retail_sales) as "Retail_Sales", 
+		sum(retail_transfers) as "Retail_Transfers",
+        sum(retail_transfers)-sum(retail_sales) as Difference
+from fact_sales as f
+join dim_date as d
+on f.date_id = d.date_id
+group by yearmonth
+order by Difference desc;
+-- Top 5: July 2019, March 2019, November 2017, October 2017, April 2019
+
+-- 12. Which products require the highest transfer volumes?
+select item_code, item_description, sum(retail_transfers) as Transfer_Total
+from fact_sales as f
+join dim_item as d
+on f.item_id=d.item_id
+group by item_code, item_description
+order by Transfer_Total desc;
+-- Tito's Handmade Vodka, Corona Extra Loose, Heineken Loose NR
+
+-- 13. Which individual items drive the most sales volume?
+select item_code, item_description, 
+sum(retail_sales)+sum(warehouse_sales) as Sales_Total
+from fact_sales as f
+join dim_item as d
+on f.item_id=d.item_id
+group by item_code, item_description
+order by Sales_Total desc;
+-- Coronas, Heineken, Miller Lite
+
+
