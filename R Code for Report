@@ -1,0 +1,207 @@
+library(DBI)
+library(lubridate)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(janitor)
+
+# Table 1
+better_channel <- dbGetQuery(con, "
+SELECT
+  CASE
+    WHEN total_retail_sales > total_warehouse_sales THEN 'More_Retail'
+    WHEN total_retail_sales < total_warehouse_sales THEN 'More_Warehouse'
+    ELSE 'Neither'
+  END AS Better_Channel,
+  COUNT(*) AS Occurrence
+FROM (
+  SELECT
+    s.supplier_name,
+    SUM(f.retail_sales) AS total_retail_sales,
+    SUM(f.warehouse_sales) AS total_warehouse_sales
+  FROM supplier s
+  JOIN fact_sales f
+    ON s.supplier_id = f.supplier_id
+  GROUP BY s.supplier_name
+) supplier_totals
+GROUP BY Better_Channel;
+") 
+
+library(kableExtra)
+
+knitr::kable(
+  better_channel,
+  caption = "Supplier Channel Dominance",
+  align = "lc"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width = FALSE
+  )
+
+# Graph 1
+data <- read_csv("Warehouse_and_Retail_Sales.csv")
+
+data <- clean_names(data)
+
+supplier_totals <- data %>%
+  group_by(supplier) %>%
+  summarise(
+    total_ws = sum(warehouse_sales),
+    total_rs = sum(retail_sales),
+    .groups = "drop"
+  )
+
+supplier_totals %>%
+ pivot_longer(
+    cols = c(total_ws, total_rs),
+    names_to = "channel",
+    values_to = "total_sales"
+  ) %>%
+  ggplot(aes(x = total_sales)) +
+  geom_density(alpha = 0.5, fill = "orange", color = "orange") +
+  facet_wrap(~ channel, scales = "free_y",
+  labeller = as_labeller(c(
+    total_rs = "Retail Sales",
+    total_ws = "Warehouse Sales"
+  ))
+) +
+  theme_bw() +
+  labs(
+    title = "Supplier Distribution by Channel",
+    x = "Total Sales",
+    y = "Density"
+  )
+
+#Graph 2
+
+sales_growth <- dbGetQuery(con, "SELECT
+  yearmonth,
+  retail_sales,
+  warehouse_sales,
+  ROUND(
+    (retail_sales - LAG(retail_sales) OVER (ORDER BY yearmonth)) /
+    NULLIF(LAG(retail_sales) OVER (ORDER BY yearmonth), 0) * 100,
+    2
+  ) AS retail_growth_percentage,
+  ROUND(
+    (warehouse_sales - LAG(warehouse_sales) OVER (ORDER BY yearmonth)) /
+    NULLIF(LAG(warehouse_sales) OVER (ORDER BY yearmonth), 0) * 100,
+    2
+  ) AS warehouse_growth_percentage,
+  CASE
+    WHEN retail_sales - LAG(retail_sales) OVER (ORDER BY yearmonth)
+       > warehouse_sales - LAG(warehouse_sales) OVER (ORDER BY yearmonth)
+      THEN 'Retail Growing Faster'
+    WHEN retail_sales - LAG(retail_sales) OVER (ORDER BY yearmonth)
+       < warehouse_sales - LAG(warehouse_sales) OVER (ORDER BY yearmonth)
+      THEN 'Warehouse Growing Faster'
+    ELSE 'Equal Growth'
+  END AS growth_comparison
+FROM (
+  SELECT
+    d.yearmonth,
+    SUM(f.retail_sales) AS retail_sales,
+    SUM(f.warehouse_sales) AS warehouse_sales
+  FROM fact_sales f
+  JOIN dim_date d ON f.date_id = d.date_id
+  GROUP BY d.yearmonth
+) monthly_sales
+ORDER BY yearmonth;")
+
+sales_growth <- sales_growth %>%
+  mutate(
+    month_date = as.Date(paste0(yearmonth, "-01"))
+  )
+
+sales_growth_complete <- sales_growth %>%
+  complete(
+    month_date = seq(
+      min(month_date),
+      max(month_date),
+      by = "month"
+    )
+  )
+
+sales_growth_complete %>%
+  pivot_longer(
+    cols = c(retail_growth_percentage, warehouse_growth_percentage),
+    names_to = "channel",
+    values_to = "growth"
+  ) %>% 
+  mutate(
+    channel = recode(
+      channel,
+      retail_growth_percentage = "Retail",
+      warehouse_growth_percentage = "Warehouse"
+    )
+  ) %>%
+  ggplot(aes(x = month_date, y = growth, color = channel, group = channel)) +
+  geom_line() +
+  geom_point(na.rm = TRUE) +
+  scale_color_manual(
+    values = c(
+      "Retail" = "orangered",
+      "Warehouse" = "orange"
+    )
+  ) +
+  theme_bw() +
+  labs(
+    title = "Month-over-Month Sales Growth by Channel",
+    x = "Month",
+    y = "Growth (%)",
+    color = "Channel",
+    caption = ""
+  )
+
+#Graph 3: Product Mix
+item_type_sales <- dbGetQuery(con, "select item_type as Item_Type,
+sum(retail_sales) as Total_Retail_Sales, 
+		sum(warehouse_sales) as Total_Warehouse_Sales
+ FROM fact_sales AS f
+    JOIN dim_item AS d ON f.item_id = d.item_id
+where item_type != ''
+group by item_type
+order by Total_Retail_Sales desc
+                              ")
+
+item_type_t7 <- item_type_sales %>%
+  mutate(Total_Sales = Total_Retail_Sales + Total_Warehouse_Sales) %>%
+  arrange(desc(Total_Sales)) %>%
+  slice_head(n = 7)
+
+item_type_long <- item_type_t7 %>%
+  pivot_longer(
+    cols = c(Total_Retail_Sales, Total_Warehouse_Sales),
+    names_to = "channel",
+    values_to = "sales"
+  ) %>%
+  mutate(
+    channel = recode(
+      channel,
+      Total_Retail_Sales = "Retail",
+      Total_Warehouse_Sales = "Warehouse"
+    )
+  ) %>% filter(Item_Type!= "REF")
+
+item_type_long %>% ggplot(aes(
+    x = reorder(Item_Type, sales),
+    y = sales,
+    fill = channel
+  )
+) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    title = "Top 7 Item Types by Sales, Retail vs Warehouse",
+    subtitle = "Q4 in SQL",
+    x = "Item Type",
+    y = "Total Sales",
+    fill = "Channel"
+  ) + scale_y_continuous(labels = scales::comma)+ scale_fill_manual(
+  values = c(
+    "Retail" = "orangered",
+    "Warehouse" = "orange"
+  )
+)
